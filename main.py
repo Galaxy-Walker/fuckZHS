@@ -6,7 +6,8 @@ import requests
 import platform
 from functools import partial
 from contextlib import suppress
-from fucker import Fucker
+from fucker import Fucker, CaptchaAbort, CaptchaException
+from habit import HabitState
 from logger import logger
 from ObjDict import ObjDict
 from utils import showImage, cookie_jar_to_list
@@ -118,6 +119,21 @@ parser.add_argument("-ai", "--aicourse", type=str, nargs=2,
 parser.add_argument("--noexam", type=bool,
                     help="Disable AI exam")
 
+parser.add_argument("--habit", action="store_true",
+                    help="刷一次习惯分：重刷已完成视频凑够 --habit-minutes 分钟（仅知到课程）")
+parser.add_argument("--habit-minutes", type=int, default=25,
+                    help="每次习惯分目标分钟数，默认 25")
+parser.add_argument("--habit-sessions", type=int, default=5,
+                    help="需要完成的总次数，默认 5")
+parser.add_argument("--habit-status", action="store_true",
+                    help="查看习惯分完成进度后退出，不需要登录")
+parser.add_argument("--habit-reset", action="store_true",
+                    help="重置当前课程的习惯分记录（配合 --habit 使用）")
+parser.add_argument("--captcha-timeout", type=int, default=300,
+                    help="验证码人工处理超时秒数，默认 300（5 分钟）")
+parser.add_argument("--captcha-retry-interval", type=int, default=10,
+                    help="验证码等待期间的重试间隔秒数，默认 10")
+
 args = parser.parse_args()
 
 course = args.course
@@ -144,6 +160,15 @@ if logger.getLevel() == "DEBUG":
           "DEBUG MODE ENABLED\n" +
           "SENSITIVE DATA WILL BE LOGGED\n" +
           "*****************************\n")
+
+# show habit progress without logging in
+if args.habit_status:
+    print(HabitState.summary_all(
+        getRealPath("habit_state.json"),
+        target_sessions=args.habit_sessions,
+        minutes=args.habit_minutes,
+    ))
+    exit(0)
 
 if args.proxy:  # parse proxy
     match args.proxy.lower().split("://"):
@@ -179,6 +204,8 @@ with open(getRealPath("meta.json"), "r") as f:
 # create an instance, now we are talking... or fucking
 fucker = Fucker(proxies=proxies, speed=args.speed, end_thre=args.threshold, limit=args.limit,
                 pushplus_token=pushplus_token, bark_token=bark_token, tree_view=tree_view, progressbar_view=progressbar_view, image_path=image_path)
+fucker.captcha_timeout = max(0, args.captcha_timeout)
+fucker.captcha_retry_interval = max(0.1, args.captcha_retry_interval)
 
 cookies_path = getRealPath("./cookies.json")
 cookies_loaded = False
@@ -188,15 +215,11 @@ if save_cookies and os.path.exists(cookies_path):
         cookies = json.loads(raw)
     with suppress(Exception):
         fucker.cookies = cookies
-        ls = fucker.getZhidaoList()
-        if ls:
-            fucker.getZhidaoContext(ls[-1].secret)
-        ls = fucker.getHikeList()
-        if ls:
-            fucker.getHikeContext(ls[-1].courseId)
-
-        ls = fucker.getZhidaoAiList()
-        if ls:
+        # only validate the session; courses/contexts are fetched on demand
+        try:
+            fucker.getZhidaoList()
+        except CaptchaException:
+            # the session is valid, it just needs a manual captcha
             pass
         print("Successfully recovered from saved cookies\n")
         cookies_loaded = True
@@ -282,6 +305,74 @@ if args.aicourse:
 
 
 exec_list = getRealPath("execution.json")
+
+# habit-score mode: replay finished Zhidao videos to fill the target minutes
+if args.habit:
+    habit_course = args.course[0] if args.course else None
+    if not habit_course and os.path.isfile(exec_list):
+        try:
+            with open(exec_list, "r", encoding="utf-8") as f:
+                items = json.load(f)
+            candidates = [(str(item.get("name", "")), str(item.get("id", "")))
+                          for item in items
+                          if re.search(r"[a-zA-Z]", str(item.get("id", "")))]
+            # prefer the confirmed course, otherwise use the first Zhidao course
+            for name, cid in candidates:
+                if "形势与政策" in name:
+                    habit_course = cid
+                    break
+            if not habit_course and candidates:
+                habit_course = candidates[0][1]
+        except Exception as e:
+            print(f"* 读取课程清单失败: {e}")
+    if not habit_course:
+        print("* 未找到知到课程，请用 -c 指定《形势与政策》的课程 ID")
+        exit(1)
+    if not re.search(r"[a-zA-Z]", str(habit_course)):
+        print("* 习惯分重刷目前只支持知到课程（形策），hike 未适配")
+        exit(1)
+
+    habit_state = HabitState(
+        getRealPath("habit_state.json"),
+        getattr(fucker, "uuid", None) or "default",
+        str(habit_course),
+        target_sessions=args.habit_sessions,
+        minutes=args.habit_minutes,
+    )
+    if args.habit_reset:
+        habit_state.reset()
+        print("* 已重置该课程的习惯分记录")
+        exit(0)
+
+    can_start, reason = habit_state.can_start()
+    if not can_start:
+        if reason == "done":
+            print(f"* 已完成 {habit_state.completed_sessions()}/"
+                  f"{habit_state.target_sessions} 次习惯分，无需再刷")
+        else:
+            print(f"* 今天已经完成一次（{habit_state.completed_sessions()}/"
+                  f"{habit_state.target_sessions}）。服务器按天记一次，"
+                  "同一天重复刷不会增加次数，请改天再运行。")
+        exit(0)
+
+    try:
+        fucker.fuckHabit(str(habit_course), habit_state,
+                         minutes=args.habit_minutes)
+    except CaptchaAbort:
+        print("* 程序已退出：验证码未处理，进度已保存；重新运行会继续")
+        exit(2)
+    except CaptchaException as e:
+        print(f"* 程序已退出：需要验证码（{e}），进度已保存；重新运行会继续")
+        exit(2)
+    except Exception as e:
+        logger.exception(e)
+        print(f"* 习惯分刷取失败: {e}")
+        exit(1)
+
+    print(f"* 今日习惯分完成：{habit_state.today_seconds() / 60:.1f} 分钟；"
+          f"进度 {habit_state.completed_sessions()}/{habit_state.target_sessions} 次")
+    exit(0)
+
 # fetch course list
 if args.fetch:
     with open(exec_list, "w") as f:
@@ -303,26 +394,38 @@ if not course and os.path.isfile(exec_list):
 
 # still not found?
 if not course:
-    fucker.fuckWhatever()
+    try:
+        fucker.fuckWhatever()
+    except (CaptchaAbort, CaptchaException) as e:
+        print(f"* 程序已退出：需要验证码（{e}），进度已保存")
+        exit(2)
     exit(0)
 
 # auto detect mode
-for c in course.copy():
-    if args.videos:
-        for v in args.videos:
+try:
+    for c in course.copy():
+        if args.videos:
+            for v in args.videos:
+                try:
+                    fucker.fuckVideo(course_id=c, video_id=v)
+                    print(f"fucked {v}")
+                    args.videos.remove(v)
+                except (CaptchaAbort, CaptchaException):
+                    raise
+                except Exception:
+                    pass
+        else:
             try:
-                fucker.fuckVideo(course_id=c, video_id=v)
-                print(f"fucked {v}")
-                args.videos.remove(v)
-            except Exception:
-                pass
-    else:
-        try:
-            fucker.fuckCourse(course_id=c)
-            course.remove(c)
-        except Exception as e:
-            logger.exception(e)
-            print(f"Error when fucking course {c}:\n{e}")
+                fucker.fuckCourse(course_id=c)
+                course.remove(c)
+            except (CaptchaAbort, CaptchaException):
+                raise
+            except Exception as e:
+                logger.exception(e)
+                print(f"Error when fucking course {c}:\n{e}")
+except (CaptchaAbort, CaptchaException) as e:
+    print(f"* 程序已退出：需要验证码（{e}），进度已保存")
+    exit(2)
 if args.videos:
     print(f"*the following videos are not fucked: {args.videos}")
 

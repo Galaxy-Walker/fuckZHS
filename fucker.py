@@ -1,5 +1,5 @@
 from zd_utils import Cipher, getEv, WatchPoint, HOME_KEY, VIDEO_KEY, QA_KEY, AI_KEY, EXAM_KEY
-from utils import progressBar, HMS, wipeLine, list_to_cookie_jar, getRealPath
+from utils import progressBar, HMS, wipeLine, list_to_cookie_jar, getRealPath, showToast
 from urllib.parse import unquote_plus as unquote
 from requests.adapters import HTTPAdapter, Retry
 from requests.cookies import RequestsCookieJar
@@ -55,6 +55,10 @@ class TimeLimitExceeded(TimeoutError):
     pass
 
 class CaptchaException(Exception):
+    pass
+
+class CaptchaAbort(Exception):
+    """The captcha was not solved within the allowed time."""
     pass
 
 class Fucker:
@@ -115,6 +119,9 @@ class Fucker:
         self.tree_view = tree_view
         self.progressbar_view = progressbar_view
         self.image_path = image_path
+        self.captcha_timeout = 300          # seconds to wait for a manual captcha
+        self.captcha_retry_interval = 10    # seconds between retries
+        self.captcha_pending = False        # set while a captcha is waiting
 
     @property # cannot directly manipulate _cookies property, we need to parse uuid from cookies
     def cookies(self) -> RequestsCookieJar:
@@ -301,6 +308,8 @@ class Fucker:
         for i in zhidao_ids:
             try:
                 self.fuckZhidaoCourse(i)
+            except (CaptchaAbort, CaptchaException):
+                raise
             except Exception as e:
                 logger.exception(e)
                 continue
@@ -308,6 +317,8 @@ class Fucker:
         for i in hike_ids:
             try:
                 self.fuckHikeCourse(i)
+            except CaptchaAbort:
+                raise
             except Exception as e:
                 logger.exception(e)
                 continue
@@ -434,8 +445,16 @@ class Fucker:
         logger.info(f"Fucking Zhidao course {RAC_id}")
         tprint = print if self.tree_view else lambda *a, **k: None
 
-        # load context
-        ctx = self.getZhidaoContext(RAC_id)
+        # load context (a captcha may be requested before any video starts)
+        base_context = {
+            "course_id": str(RAC_id),
+            "course_name": str(RAC_id),
+            "video_id": "",
+            "video_name": "",
+            "url": self._zhidao_course_url(RAC_id),
+        }
+        ctx = self._run_with_captcha(
+            lambda: self.getZhidaoContext(RAC_id), base_context)
         course = ctx.course
         chapters = ctx.chapters
         
@@ -467,13 +486,12 @@ class Fucker:
                             tprint(prefix)
                             tprint(f"{prefix}##Fucking time limit exceeded: {e}\n")
                             return
+                        except CaptchaAbort:
+                            raise
                         except CaptchaException:
-                            logger.info("Captcha required")
-                            self._pushplus("fuckZHS","需要提供验证码")
-                            self._bark("fuckZHS","需要提供验证码")
-                            tprint(prefix)
-                            tprint(f"{prefix}##Captcha required\a\n")
-                            return
+                            # the video loop handles captchas; if one escapes,
+                            # let the top-level handler deal with it
+                            raise
                         except Exception as e:
                             logger.exception(e)
                             self._pushplus("fuckZHS",e)
@@ -485,45 +503,93 @@ class Fucker:
         tprint(prefix)
         tprint(f"\r{prefix}__Fucked course {course.courseInfo.name}, cost {time.time()-begin_time:.2f}s\n")
     
-    def fuckZhidaoVideo(self, RAC_id, video_id):
+    def fuckZhidaoVideo(self, RAC_id, video_id, force=False, max_seconds=None,
+                        on_progress=None, captcha_context=None):
         """
         * `RAC_id`: `recruitAndCourseId`
         * `video_id`: `videoId`
+        * `force`: replay a finished video
+        * `max_seconds`: stop after this many seconds of actual playback
+        * `on_progress`: called with the number of active playback seconds
+        * returns active playback seconds (0 for an already watched video)
         """
         self._checkCookies()
-        self._checkTimeLimit(RAC_id)
-        ctx = self.getZhidaoContext(RAC_id)
+        if not force:
+            self._checkTimeLimit(RAC_id)
+        base_context = {
+            "course_id": str(RAC_id),
+            "course_name": str(RAC_id),
+            "video_id": str(video_id),
+            "video_name": "",
+            "url": self._zhidao_course_url(RAC_id),
+        }
+        ctx = self._run_with_captcha(
+            lambda: self.getZhidaoContext(RAC_id), base_context)
         self._sessionReady(ctx)
-        video = ctx.videos[video_id]
-        played_time = video.studyTotalTime
-        watch_state = video.watchState
+        video = ctx.videos.get(video_id)
+        if video is None:
+            # CLI video ids are strings while API ids are usually ints
+            for key in (str(video_id), int(video_id) if str(video_id).isdigit() else None):
+                if key is not None and key in ctx.videos:
+                    video = ctx.videos[key]
+                    break
         if not video:
             raise ValueError(f"Video {video_id} not found")
-        if watch_state == 1 and self.end_thre <= 1.0:  # check end_thre in case someone wants to rewatch
-            logger.info(f"Video {video.name} already watched")
-            return
-        # get token id from pre learning note
-        token_id = self.prelearningNote(RAC_id, video_id).studiedLessonDto.id
-        token_id = b64encode(str(token_id).encode()).decode()
 
-        # get questions
-        questions: ObjDict = self.loadVideoPointerInfo(RAC_id, video_id)
-        questions.default = None
-        questions = questions.questionPoint or []
-        questions = sorted(questions, key=lambda x: x.timeSec, reverse=True) if questions else None
-        while questions and questions[-1].timeSec <= played_time:
-            questions.pop() # remove questions that are already answered
+        played_time = int(video.get("studyTotalTime") or 0)
+        watch_state = video.get("watchState")
+        if watch_state == 1 and self.end_thre <= 1.0 and not force:
+            logger.info(f"Video {video.name} already watched")
+            return 0
+
+        context = captcha_context or self._captcha_context(RAC_id, video)
+
+        # get token id from pre learning note; the server may ask for a captcha
+        def _get_note():
+            note = self.prelearningNote(RAC_id, video_id)
+            if note.get("isSlide"):
+                raise CaptchaException("prelearningNote.isSlide")
+            return note
+
+        note = self._run_with_captcha(_get_note, context)
+        token_id = b64encode(str(note.studiedLessonDto.id).encode()).decode()
+
+        # get questions; on a rewatch they were already answered, so skip them
+        if force:
+            questions = None
+        else:
+            def _get_questions():
+                q = self.loadVideoPointerInfo(RAC_id, video_id)
+                q.default = None
+                return q
+
+            questions = self._run_with_captcha(_get_questions, context)
+            questions = questions.get("questionPoint") or []
+            questions = sorted(questions, key=lambda x: x.timeSec, reverse=True) if questions else None
+            while questions and questions[-1].timeSec <= played_time:
+                questions.pop()  # remove questions that are already answered
 
         # compute end time and make sure to answer all questions
-        end_time = max(video.videoSec * self.end_thre, 1.0)
-        if questions:
-            end_time = max(questions[0].timeSec, end_time) # compare last question time with end_time
+        video_sec = int(video.get("videoSec") or 1)
+        if force:
+            # one extra pass of the video; max_seconds can stop earlier
+            end_time = played_time + max(video_sec, 1)
+        else:
+            end_time = max(video_sec * self.end_thre, 1.0)
+            if questions:
+                end_time = max(questions[0].timeSec, end_time)
 
         # emulating video playing
         self.watchVideo(video.videoId)
 
-        # no idea what it is
-        self.threeDimensionalCourseWare(video.videoId)
+        # no idea what it is; non-essential, so don't abort the video on failure
+        try:
+            self._run_with_captcha(
+                lambda: self.threeDimensionalCourseWare(video.videoId), context)
+        except CaptchaAbort:
+            raise
+        except Exception as e:
+            logger.warning(f"threeDimensionalCourseWare failed: {e}")
 
         # prepare vars
         speed = self.speed or 1.5  # default speed for Zhidao is 1.5
@@ -535,12 +601,28 @@ class Fucker:
         report = False      # report flag, do not modify
         pause = 0           # pause flag, do not modify
         wp = WatchPoint()   # watch point, do not modify
+        wp.reset(played_time)  # start from the resume/replay position
+        active_seconds = 0  # real playback seconds, excludes pauses/captcha waits
+
+        def _refresh_token():
+            nonlocal token_id
+            note = self.prelearningNote(RAC_id, video_id)
+            if note.get("isSlide"):
+                raise CaptchaException("prelearningNote.isSlide")
+            token_id = b64encode(str(note.studiedLessonDto.id).encode()).decode()
+
+        def _report():
+            self.saveDatabaseIntervalTimeV2(
+                RAC_id, video_id, played_time, last_submit, wp.get(), token_id)
 
         ##### start main event loop, sort of...
         while played_time < end_time:
+            if max_seconds is not None and active_seconds >= max_seconds:
+                break
             time.sleep(1)
             ctx.fucked_time += 1 # for time limit check
             elapsed_time += 1
+            previous_played = played_time
             played_time = min(played_time+speed, end_time) # update video time and make sure not exceeding end_time
             pause = pause or int(random() < 0.0025)*60 # randomly pause a minute, may avoid detection
             report = report or pause == 60  # report on pause
@@ -573,12 +655,17 @@ class Fucker:
                 else:
                     pause = pause or 1 # emulate pause on pop quiz
                     answer -= 1
+            ## count actual playback time
+            if not pause and played_time > previous_played:
+                active_seconds += 1
+                if on_progress:
+                    on_progress(active_seconds)
             ## report to database
             if elapsed_time % db_interval == 0 or played_time >= end_time or report:
                 report = False # unset report flag
                 wp.add(played_time)
-                # now submit to database
-                self.saveDatabaseIntervalTimeV2(RAC_id,video_id,played_time,last_submit,wp.get(),token_id)
+                # now submit to database, waiting for a captcha if needed
+                self._run_with_captcha(_report, context, prepare=_refresh_token)
                 last_submit = played_time # update last pause time
                 wp.reset(played_time)     # reset watch point
             ## report to cache
@@ -589,13 +676,140 @@ class Fucker:
                 wp.reset(played_time)     # reset watch point
             ### end events
             # print progress bar
-            s, e = [60-pause, 60] if pause else [played_time, end_time]
-            # have a glance of when quiz is answered
-            action = "pause a minute" if pause else \
-                    f"fucking {video.videoId}" if answer is None else "answering quiz"
-            progressBar(s, e, prefix=action, suffix="done", progressbar_view=self.progressbar_view)
+            if max_seconds is not None:
+                progressBar(active_seconds, max_seconds,
+                            prefix=f"habit {video.videoId}", suffix="done",
+                            progressbar_view=self.progressbar_view)
+            else:
+                s, e = [60-pause, 60] if pause else [played_time, end_time]
+                # have a glance of when quiz is answered
+                action = "pause a minute" if pause else \
+                        f"fucking {video.videoId}" if answer is None else "answering quiz"
+                progressBar(s, e, prefix=action, suffix="done", progressbar_view=self.progressbar_view)
         ##### end main event loop
+
+        # flush the last partial interval so that a 25-minute session is complete
+        if played_time > last_submit:
+            wp.add(played_time)
+            self._run_with_captcha(_report, context, prepare=_refresh_token)
+            last_submit = played_time
+            wp.reset(played_time)
+
+        video["studyTotalTime"] = max(
+            played_time, int(video.get("studyTotalTime") or 0))
+        if force:
+            # a habit/replay pass leaves the video completed
+            video["watchState"] = 1
         time.sleep(random()+1) # old Joe needs more sleep
+        return active_seconds
+
+    def fuckHabit(self, RAC_id, state, minutes: int = 25, course_name: str = None):
+        """Replay finished Zhidao videos until today's habit session is complete.
+
+        `state` is a :class:`habit.HabitState` instance.  Only Zhidao courses are
+        supported; Hike replays use a different API and are intentionally left
+        alone.
+        """
+        logger.info(f"Fucking habit session for {RAC_id}")
+        base_context = {
+            "course_id": str(RAC_id),
+            "course_name": course_name or str(RAC_id),
+            "video_id": "",
+            "video_name": "",
+            "url": self._zhidao_course_url(RAC_id),
+        }
+        ctx = self._run_with_captcha(
+            lambda: self.getZhidaoContext(RAC_id, force=True), base_context)
+        try:
+            display_name = ctx.course.courseInfo.name or ctx.course.courseInfo.enName
+        except Exception:
+            display_name = course_name or str(RAC_id)
+        print(f"* 习惯分重刷: {display_name}")
+
+        videos = []
+        for video in ctx.videos.values():
+            try:
+                duration = int(video.get("videoSec") or 0)
+                studied = int(video.get("studyTotalTime") or 0)
+                watched = video.get("watchState") == 1
+            except Exception:
+                continue
+            if duration > 0 and (watched or studied >= duration * 0.9):
+                videos.append(video)
+        if not videos:
+            raise RuntimeError("没有已完成的视频可重刷，请先运行正常刷课模式")
+        videos.sort(key=lambda v: int(v.get("videoSec") or 0), reverse=True)
+
+        target = state.target_seconds
+        remaining = state.remaining_seconds()
+        if remaining <= 0:
+            state.mark_today_complete()
+            return state
+
+        # one pass takes videoSec / speed real seconds; leave enough rounds to
+        # reach the target even when the course only has a few short videos
+        total_real_seconds = (sum(int(v.get("videoSec") or 0) for v in videos)
+                              / (self.speed or 1.5)) or 1
+        max_rounds = min(20, max(3, int(target / total_real_seconds) + 2))
+        rounds = 0
+        while remaining > 0 and rounds < max_rounds:
+            progressed = 0
+            for video in videos:
+                if remaining <= 0:
+                    break
+                video_context = self._captcha_context(RAC_id, video)
+                progress = {"active": 0, "saved": 0}
+                before_video = state.today_seconds()
+
+                def on_progress(active, progress=progress):
+                    progress["active"] = active
+                    if active - progress["saved"] >= 30:
+                        state.add_seconds(active - progress["saved"])
+                        progress["saved"] = active
+
+                try:
+                    played = self.fuckZhidaoVideo(
+                        RAC_id, video.videoId, force=True,
+                        max_seconds=remaining, on_progress=on_progress,
+                        captcha_context=video_context,
+                    )
+                except CaptchaAbort:
+                    if progress["active"] > progress["saved"]:
+                        state.add_seconds(progress["active"] - progress["saved"])
+                    raise
+                except Exception as e:
+                    logger.exception(e)
+                    print(f"* 重刷视频 {video.get('name') or video.videoId} 失败: {e}")
+                    if progress["active"] > progress["saved"]:
+                        state.add_seconds(progress["active"] - progress["saved"])
+                    remaining = state.remaining_seconds()
+                    progressed += state.today_seconds() - before_video
+                    continue
+
+                if played > progress["saved"]:
+                    state.add_seconds(played - progress["saved"])
+                progressed += played
+                remaining = state.remaining_seconds()
+                print(f"* 重刷 {video.get('name') or video.videoId}: {played}s，"
+                      f"今日 {state.today_seconds() / 60:.1f}/{minutes} 分钟")
+                if remaining <= 0:
+                    break
+            if progressed <= 0:
+                break
+            rounds += 1
+
+        if state.today_seconds() >= target:
+            state.mark_today_complete()
+            showToast(
+                "习惯分完成",
+                (f"第 {state.completed_sessions()}/{state.target_sessions} 次完成，"
+                 f"今日 {state.today_seconds() // 60} 分钟\n下次请在另一天运行"),
+                duration=20, kind="success",
+            )
+            return state
+
+        raise RuntimeError(
+            f"重刷未凑满 {minutes} 分钟（今日 {state.today_seconds() / 60:.1f} 分钟）")
 
     def answerZhidao(self, q:dict):
         """you can override this function to answer questions"""
@@ -624,14 +838,16 @@ class Fucker:
             form = json.dumps(form)
         ret = self._apiQuery(url, data=form, method=method,
                              contentType=contentType)
+        code = ret.get("code", 0)
+        if code == -12:
+            # risk control asks for a Yidun captcha; the caller must handle it
+            e = CaptchaException(f"code -12 from {url}")
+            logger.error(e)
+            raise e
         if ok_code is not None and ret.code != ok_code:
             ret.default = None
-            match ret.code:
-                case -12:
-                    e = CaptchaException("captcha required")
-                case _:
-                    e = Exception(f"code: {ret.code} " +
-                                  f"msg: {ret.message or json.dumps(ret,indent=4,ensure_ascii=False)}")
+            e = Exception(f"code: {ret.code} " +
+                          f"msg: {ret.message or json.dumps(ret,indent=4,ensure_ascii=False)}")
             logger.error(e)
             raise e
         return ret
@@ -1092,7 +1308,17 @@ class Fucker:
                 e = ValueError(f"Unsupport method: {method}")
                 logger.error(e)
                 raise e
-        ret = ObjDict(r.json())
+        text = r.text or ""
+        low = text.lower()
+        if "yidun" in low or "initnec" in low or "captcha" in low:
+            # some risk-control responses are HTML captcha pages instead of JSON
+            raise CaptchaException(f"captcha page from {url}")
+        try:
+            ret = ObjDict(r.json())
+        except ValueError:
+            if "验证码" in text or "安全验证" in text:
+                raise CaptchaException(f"verification page from {url}")
+            raise
         logger.debug(json.dumps(ret, indent=4, ensure_ascii=False))
         return ret
 
@@ -1105,6 +1331,151 @@ class Fucker:
     def _checkTimeLimit(self, cid):
         if self.limit and self.context[cid].fucked_time >= self.limit*60:
             raise TimeLimitExceeded(f"{self.limit} minutes")
+
+    # ------------------------------------------------------------- captcha
+    def _zhidao_course_url(self, RAC_id):
+        return ("https://studyh5.zhihuishu.com/videoStudy.html"
+                f"#/studyVideo?recruitAndCourseId={RAC_id}")
+
+    def _captcha_context(self, RAC_id, video=None, video_name=None):
+        """Build a human-readable context for the captcha notification."""
+        course_name = ""
+        try:
+            ctx = self.context.get(RAC_id) or {}
+            course = ctx.get("course") or {}
+            info = course.get("courseInfo") or {}
+            course_name = info.get("name") or info.get("enName") or ""
+        except Exception:
+            pass
+        video_id = ""
+        if video is not None:
+            try:
+                video_id = str(video.get("videoId", ""))
+            except Exception:
+                video_id = str(video)
+            if video_name is None:
+                try:
+                    video_name = video.get("name") or ""
+                except Exception:
+                    video_name = ""
+        return {
+            "course_id": str(RAC_id),
+            "course_name": course_name or str(RAC_id),
+            "video_id": video_id,
+            "video_name": video_name or "",
+            "url": self._zhidao_course_url(RAC_id),
+        }
+
+    def _captcha_pending_path(self):
+        return getRealPath("./captcha_pending.json")
+
+    def _write_captcha_pending(self, context: dict, reason: str):
+        try:
+            data = {
+                "time": datetime.now().astimezone().isoformat(timespec="seconds"),
+                "reason": reason,
+                **context,
+            }
+            with open(self._captcha_pending_path(), "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+        except Exception as exc:
+            logger.warning(f"failed to write captcha_pending.json: {exc}")
+
+    def _clear_captcha_pending(self):
+        try:
+            path = self._captcha_pending_path()
+            if os.path.exists(path):
+                os.remove(path)
+        except Exception as exc:
+            logger.warning(f"failed to remove captcha_pending.json: {exc}")
+
+    def _notify_captcha(self, exc, context: dict):
+        """Tell the user that a manual captcha is required; no sound."""
+        self.captcha_pending = True
+        context = context or {}
+        course = context.get("course_name") or context.get("course_id") or "未知课程"
+        video = context.get("video_name") or ""
+        position = course + (f" · {video}" if video else "")
+        url = context.get("url") or ""
+        timeout = int(self.captcha_timeout)
+        timeout_text = f"{timeout // 60} 分钟" if timeout >= 60 else f"{timeout} 秒"
+
+        print("\n" + "=" * 62)
+        print("!! 智慧树要求验证码（网易易盾点选）!!")
+        print(f"位置: {position}")
+        print(f"原因: {exc}")
+        if url:
+            print(f"课程页: {url}")
+        print(f"请在浏览器完成点选，完成后关闭课程页；{timeout_text}内未处理将退出。")
+        print(f"脚本每 {self.captcha_retry_interval} 秒自动重试，无需按 Enter。")
+        print("=" * 62 + "\n")
+        logger.warning(f"captcha required: {position}: {exc}")
+
+        showToast(
+            "智慧树需要验证",
+            (f"{position}\n请完成易盾点选后关闭课程页，"
+             f"{timeout_text}内未处理将退出"),
+            url=url, duration=30, kind="warning",
+        )
+        self._write_captcha_pending(context, str(exc))
+
+    def _notify_captcha_success(self, context: dict):
+        self.captcha_pending = False
+        print("* 验证已通过，继续刷课")
+        showToast("验证已通过", "继续刷课", duration=5, kind="success")
+        self._clear_captcha_pending()
+
+    def _notify_captcha_exit(self, context: dict):
+        self.captcha_pending = False
+        print("* 验证码未处理，程序即将退出")
+        showToast(
+            "程序已退出",
+            "验证码未处理，进度已保存；重新运行会继续",
+            duration=30, kind="error",
+        )
+
+    def _run_with_captcha(self, func, context: dict = None, prepare=None):
+        """Run func, waiting for a manual captcha and retrying on code -12.
+
+        `prepare` is called before every retry (not before the first attempt),
+        which lets callers refresh an expired learning token.
+        """
+        context = context or {}
+        deadline = time.time() + max(0, int(self.captcha_timeout))
+        notified = False
+        retried = False
+        while True:
+            try:
+                if retried and prepare is not None:
+                    prepare()
+                retried = True
+                result = func()
+                if notified:
+                    self._notify_captcha_success(context)
+                return result
+            except CaptchaException as exc:
+                if not notified:
+                    self._notify_captcha(exc, context)
+                    notified = True
+                else:
+                    logger.info(f"captcha still required: {exc}")
+                remaining = deadline - time.time()
+                if remaining <= 0:
+                    # one last attempt in case the user solved it just now
+                    try:
+                        if prepare is not None:
+                            prepare()
+                        result = func()
+                    except CaptchaException as final_exc:
+                        self._notify_captcha_exit(context)
+                        raise CaptchaAbort("captcha timeout") from final_exc
+                    if notified:
+                        self._notify_captcha_success(context)
+                    return result
+                wait = min(max(0.1, float(self.captcha_retry_interval)), remaining)
+                print(f"* 仍需验证，约 {int(remaining)} 秒后重试；"
+                      "请在浏览器完成易盾点选，完成后关闭课程页。")
+                time.sleep(wait)
 
     def _sessionReady(self, ctx:dict=None):
         ctx = ObjDict(ctx or {}, recursive=False, default=False)

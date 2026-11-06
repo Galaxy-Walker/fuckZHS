@@ -3,6 +3,7 @@
 import io
 import os
 import sys
+import subprocess
 from requests.cookies import RequestsCookieJar, create_cookie
 from PIL import Image, ImageOps
 from datetime import timedelta
@@ -143,6 +144,36 @@ def cookie_jar_to_list(cookie_jar: RequestsCookieJar):
         }
         cookies_list.append(cookie_dict)
     return cookies_list
+
+def showToast(title: str, message: str, url: str = "", duration: float = 20,
+              kind: str = "info"):
+    """Show a bottom-right toast in a separate process.
+
+    The helper never blocks the caller, so the main script can continue waiting
+    for a captcha while the notification is visible.
+    """
+    try:
+        script = os.path.join(getDir(), "toast.py")
+        cmd = [
+            sys.executable, script,
+            "--title", str(title),
+            "--message", str(message),
+            "--duration", str(duration),
+            "--kind", kind,
+        ]
+        if url:
+            cmd += ["--url", str(url)]
+        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+        subprocess.Popen(
+            cmd, cwd=getDir(), close_fds=True,
+            creationflags=creationflags,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+    except Exception as exc:
+        # Never let a notification failure break the fucker
+        print(f"[通知] {title}: {message}")
+        print(f"[通知] 弹窗启动失败: {exc}")
+
 
 # Converting list to requests.cookies.RequestCookieJar
 def list_to_cookie_jar(cookies_list: list[dict]):

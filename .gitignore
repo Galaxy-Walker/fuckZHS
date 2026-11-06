@@ -3,6 +3,8 @@
 config.json
 cookies.json
 execution.json
+habit_state.json
+captcha_pending.json
 *.js
 .DS_Store
 
@@ -139,3 +141,4 @@ dmypy.json
 aiexamAnswer
 AiDownloadCache
 .vscode
+.dsh_tmp/

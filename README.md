@@ -201,6 +201,32 @@ python main.py --fetch
 ]
 ```
 
+### 习惯分重刷（仅知到 / 形策）
+
+智慧树的习惯分按天记一次：某天学习满 25 分钟算一次。课程已经刷完后，可以用 `--habit` 重刷已完成视频来凑时长：
+
+```bash
+# 自动从 execution.json 里找《形势与政策》
+python main.py --habit
+# 指定课程
+python main.py -c 4e5f5a5a405b4859454a58595843584a5e --habit
+# 查看进度，不需要登录
+python main.py --habit-status
+# 自定义目标：每次 25 分钟，共 5 次（默认值）
+python main.py --habit --habit-minutes 25 --habit-sessions 5
+```
+
+- 状态保存在 `habit_state.json`，按账号 + 课程 + 日期记录；同一天重复运行只会提示，不会多算一次。
+- 需要在 **5 个不同日期**各跑一次；某天中断后，同一天再跑会接着凑当天的 25 分钟。
+- 只支持知到课程；hike 的重刷暂未适配。
+- 原有 `python main.py` 的一口气刷完逻辑不受影响。
+
+验证码：
+
+- 知到接口返回 `code: -12` 或 `prelearningNote` 返回 `isSlide=true` 时，脚本会弹出右下角通知，**不会自动打开浏览器**。
+- 点“打开课程页”去浏览器完成易盾点选，**完成后关闭课程页**；脚本每 10 秒自动重试，5 分钟内未完成会退出（退出码 2），进度已保存。
+- 可用 `--captcha-timeout` 和 `--captcha-retry-interval` 调整超时与重试间隔。
+
 ### 命令行参数列表
 
 - `-c`, `--course`: 课程 ID, `courseId` 或 `recruitAndCourseId`, 可输入多个
@@ -219,6 +245,13 @@ python main.py --fetch
 - `--progressbar_view`: 进度条控制，关闭后不显示当前视频进度。
 - `--image_path`: 登录二维码保存路径，留空则不保存。
 - `-ai`, `--aicourse`: AI课程, Input AI Course ID and CLASS ID to fu*k aiCourse
+- `--habit`: 刷一次习惯分（重刷已完成视频凑时长，仅知到课程）
+- `--habit-minutes`: 每次习惯分目标分钟数，默认 25
+- `--habit-sessions`: 需要完成的总次数，默认 5
+- `--habit-status`: 查看习惯分记录后退出，不需要登录
+- `--habit-reset`: 重置当前课程的习惯分记录（配合 `--habit`）
+- `--captcha-timeout`: 验证码人工处理超时秒数，默认 300
+- `--captcha-retry-interval`: 验证码等待期间的重试间隔秒数，默认 10
 - `-h` `--help`: 显示帮助
 
 运行示例如下:
